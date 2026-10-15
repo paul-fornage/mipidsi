@@ -14,6 +14,7 @@ rust-version = "1.75"
 [dependencies]
 defmt = { version = "1.0.1", optional = true }
 embedded-graphics-core = { git = "https://github.com/paul-fornage/embedded-graphics.git", rev = "6a96df5e" }
+embedded-hal-async = "1.0.0"
 embedded-hal = "1.0.0"
 
 [dependencies.heapless]
@@ -26,4 +27,4 @@ embedded-graphics = { git = "https://github.com/paul-fornage/embedded-graphics.g
 [features]
 default = ["batch"]
 batch = ["heapless"]
-defmt = ["dep:defmt", "embedded-hal/defmt-03"]
+defmt = ["dep:defmt", "embedded-hal/defmt-03", "embedded-hal-async/defmt-03"]
