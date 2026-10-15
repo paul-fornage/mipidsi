@@ -11,3 +11,19 @@ readme = "README.md"
 documentation = "https://docs.rs/mipidsi"
 rust-version = "1.75"
 
+[dependencies]
+defmt = { version = "1.0.1", optional = true }
+embedded-graphics-core = { git = "https://github.com/paul-fornage/embedded-graphics.git", rev = "6a96df5e" }
+embedded-hal = "1.0.0"
+
+[dependencies.heapless]
+optional = true
+version = "0.9.3"
+
+[dev-dependencies]
+embedded-graphics = { git = "https://github.com/paul-fornage/embedded-graphics.git", rev = "6a96df5e" }
+
+[features]
+default = ["batch"]
+batch = ["heapless"]
+defmt = ["dep:defmt", "embedded-hal/defmt-03"]
