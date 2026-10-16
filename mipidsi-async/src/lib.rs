@@ -4,6 +4,10 @@
 //!
 //! Uses the async `DrawTarget` from the embedded-graphics fork. Drawing writes
 //! directly to the display; there is no framebuffer or separate flush step.
+//! Adjacent pixels in row-major order share an address window and use buffered
+//! SPI transfers. The `batch` feature also buffers up to 128 isolated pixels
+//! to combine them after sorting. All pending pixels are written before
+//! `draw_iter` returns. Rectangle fills always use buffered transfers.
 //! SPI and delays use embedded-hal-async. D/C and reset use embedded-hal's
 //! `OutputPin`, since embedded-hal-async doesn't have a digital pin trait.
 //!
@@ -34,7 +38,7 @@ use embedded_graphics_core::{
         raw::{RawData, RawU16},
         Rgb565,
     },
-    primitives::{PointsIter, Rectangle},
+    primitives::Rectangle,
     Pixel,
 };
 use embedded_hal::digital::OutputPin;
@@ -43,6 +47,9 @@ use embedded_hal_async::{delay::DelayNs, spi::SpiDevice};
 const MEMORY_WIDTH: u16 = 240;
 const MEMORY_HEIGHT: u16 = 320;
 const BUFFER_BYTES: usize = 256;
+
+#[cfg(feature = "batch")]
+type PixelBatch = heapless::Vec<(usize, Pixel<Rgb565>), { BUFFER_BYTES / 2 }>;
 
 /// Display content rotation relative to the panel's portrait orientation.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -265,24 +272,83 @@ where
         &mut self,
         colors: impl IntoIterator<Item = Rgb565>,
     ) -> Result<(), Error<SPI::Error, DC::Error, RST::Error>> {
+        let mut colors = colors.into_iter();
         let mut buffer = [0u8; BUFFER_BYTES];
-        let mut used = 0;
+        let mut data_mode = false;
 
-        for color in colors {
-            let bytes = RawU16::from(color).into_inner().to_be_bytes();
-            buffer[used] = bytes[0];
-            buffer[used + 1] = bytes[1];
-            used += 2;
+        loop {
+            let mut used = 0;
+            for pixel in buffer.chunks_exact_mut(2) {
+                let Some(color) = colors.next() else {
+                    break;
+                };
+                pixel.copy_from_slice(&RawU16::from(color).into_inner().to_be_bytes());
+                used += 2;
+            }
 
-            if used == buffer.len() {
-                self.write_data(&buffer).await?;
-                used = 0;
+            if used == 0 {
+                break;
+            }
+
+            // D/C stays high for the entire stream, including across chunks.
+            if !data_mode {
+                self.dc.set_high().map_err(Error::Dc)?;
+                data_mode = true;
+            }
+            self.spi.write(&buffer[..used]).await.map_err(Error::Spi)?;
+
+            if used < buffer.len() {
+                break;
             }
         }
+        Ok(())
+    }
 
-        if used != 0 {
-            self.write_data(&buffer[..used]).await?;
+    #[cfg(feature = "batch")]
+    async fn flush_batch(
+        &mut self,
+        batch: &mut PixelBatch,
+    ) -> Result<(), Error<SPI::Error, DC::Error, RST::Error>> {
+        if batch.is_empty() {
+            return Ok(());
         }
+
+        // Keep repeated writes to the same pixel in their original order so
+        // that the last color still wins, even though other pixels are sorted.
+        batch
+            .as_mut_slice()
+            .sort_unstable_by_key(|(order, Pixel(point, _))| (point.y, point.x, *order));
+
+        let mut first = 0;
+        while first < batch.len() {
+            let Pixel(start, _) = batch[first].1;
+            let mut end = start;
+            let mut last = first + 1;
+            while let Some((_, Pixel(point, _))) = batch.get(last) {
+                if point.y != end.y || point.x != end.x + 1 {
+                    break;
+                }
+                end = *point;
+                last += 1;
+            }
+
+            self.set_window(start.x as u16, start.y as u16, end.x as u16, end.y as u16)
+                .await?;
+            if last - first == 1 {
+                let Pixel(_, color) = batch[first].1;
+                self.write_data(&RawU16::from(color).into_inner().to_be_bytes())
+                    .await?;
+            } else {
+                self.write_pixels(
+                    batch.as_slice()[first..last]
+                        .iter()
+                        .map(|(_, Pixel(_, color))| *color),
+                )
+                .await?;
+            }
+            first = last;
+        }
+        batch.clear();
         Ok(())
     }
 }
@@ -311,17 +377,74 @@ where
         I: IntoIterator<Item = Pixel<Self::Color>>,
     {
         let bounds = self.bounding_box();
-        for Pixel(point, color) in pixels {
-            if !bounds.contains(point) {
-                continue;
-            }
+        let right = bounds.size.width as i32 - 1;
+        let bottom = bounds.size.height as i32 - 1;
+        let mut pixels = pixels
+            .into_iter()
+            .filter(|Pixel(point, _)| bounds.contains(*point))
+            .peekable();
+        #[cfg(feature = "batch")]
+        let mut batch = PixelBatch::new();
 
-            let x = point.x as u16;
-            let y = point.y as u16;
-            self.set_window(x, y, x, y).await?;
-            self.write_data(&RawU16::from(color).into_inner().to_be_bytes())
+        while let Some(Pixel(start, color)) = pixels.next() {
+            // A full-width window can stream across row boundaries. A run
+            // starting partway along a row must finish that row first.
+            let end_y = if start.x == 0 { bottom } else { start.y };
+
+            let mut expected = start;
+            let mut following_colors = core::iter::from_fn(|| {
+                if expected.x == right {
+                    expected.x = 0;
+                    expected.y += 1;
+                } else {
+                    expected.x += 1;
+                }
+
+                match pixels.peek() {
+                    Some(Pixel(point, _)) if *point == expected && expected.y <= end_y => {
+                        pixels.next().map(|Pixel(_, color)| color)
+                    }
+                    _ => None,
+                }
+            });
+
+            if let Some(next_color) = following_colors.next() {
+                // Known contiguous runs stream immediately with either feature
+                // setting. Older pending writes must reach the panel first.
+                #[cfg(feature = "batch")]
+                self.flush_batch(&mut batch).await?;
+                self.set_window(start.x as u16, start.y as u16, right as u16, end_y as u16)
+                    .await?;
+                self.write_pixels(
+                    core::iter::once(color)
+                        .chain(core::iter::once(next_color))
+                        .chain(following_colors),
+                )
                 .await?;
+            } else {
+                #[cfg(feature = "batch")]
+                {
+                    let order = batch.len();
+                    batch
+                        .push((order, Pixel(start, color)))
+                        .expect("batch is flushed when full");
+                    if batch.is_full() {
+                        self.flush_batch(&mut batch).await?;
+                    }
+                }
+                #[cfg(not(feature = "batch"))]
+                {
+                    // Isolated pixels don't need a full transfer buffer.
+                    let x = start.x as u16;
+                    let y = start.y as u16;
+                    self.set_window(x, y, x, y).await?;
+                    self.write_data(&RawU16::from(color).into_inner().to_be_bytes())
+                        .await?;
+                }
+            }
         }
+        #[cfg(feature = "batch")]
+        self.flush_batch(&mut batch).await?;
         Ok(())
     }
 
@@ -342,14 +465,41 @@ where
         )
         .await?;
 
-        // Keep colors aligned with the original rectangle when clipping. Stop
-        // after the last visible pixel, or earlier if the iterator runs out.
+        // Skip clipped rows and columns without constructing a point for every
+        // input color. Use u64 for offsets: a large off-screen rectangle can
+        // have more than usize::MAX pixels on a 32-bit target.
         let count = (clipped.size.width * clipped.size.height) as usize;
-        let visible_colors = area
-            .points()
-            .zip(colors)
-            .filter_map(|(point, color)| clipped.contains(point).then_some(color))
-            .take(count);
+        let mut colors = colors.into_iter();
+        let top = (i64::from(clipped.top_left.y) - i64::from(area.top_left.y)) as u64;
+        let left = (i64::from(clipped.top_left.x) - i64::from(area.top_left.x)) as u64;
+        let mut skip = top * u64::from(area.size.width) + left;
+
+        while skip != 0 {
+            let chunk = skip.min(usize::MAX as u64) as usize;
+            if colors.nth(chunk - 1).is_none() {
+                return Ok(());
+            }
+            skip -= chunk as u64;
+        }
+
+        let row_skip = (area.size.width - clipped.size.width) as usize;
+        if row_skip == 0 {
+            // The usual case: directly stream an unclipped rectangle or one
+            // clipped only at the top and bottom.
+            return self.write_pixels(colors.take(count)).await;
+        }
+
+        let mut remaining_in_row = clipped.size.width;
+        let visible_colors = core::iter::from_fn(|| {
+            if remaining_in_row == 0 {
+                colors.nth(row_skip - 1)?;
+                remaining_in_row = clipped.size.width;
+            }
+            let color = colors.next()?;
+            remaining_in_row -= 1;
+            Some(color)
+        })
+        .take(count);
 
         self.write_pixels(visible_colors).await
     }
@@ -368,7 +518,25 @@ where
         )
         .await?;
 
-        let count = (clipped.size.width * clipped.size.height) as usize;
-        self.write_pixels(core::iter::repeat(color).take(count)).await
+        // Encode the color once and reuse the same filled buffer for every
+        // transfer instead of converting and packing each repeated pixel.
+        let mut remaining = (clipped.size.width * clipped.size.height) as usize;
+        let chunk_pixels = remaining.min(BUFFER_BYTES / 2);
+        let bytes = RawU16::from(color).into_inner().to_be_bytes();
+        let mut buffer = [0u8; BUFFER_BYTES];
+        for pixel in buffer[..chunk_pixels * 2].chunks_exact_mut(2) {
+            pixel.copy_from_slice(&bytes);
+        }
+
+        self.dc.set_high().map_err(Error::Dc)?;
+        while remaining != 0 {
+            let pixels = remaining.min(chunk_pixels);
+            self.spi
+                .write(&buffer[..pixels * 2])
+                .await
+                .map_err(Error::Spi)?;
+            remaining -= pixels;
+        }
+        Ok(())
     }
 }
