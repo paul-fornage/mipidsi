@@ -1,6 +1,6 @@
 #![no_std]
 
-//! A small async SPI driver for an ST7789 in portrait RGB565 mode.
+//! A small async SPI driver for an ST7789 in RGB565 mode.
 //!
 //! Uses the async `DrawTarget` from the embedded-graphics fork. Drawing writes
 //! directly to the display; there is no framebuffer or separate flush step.
@@ -12,12 +12,14 @@
 //!
 //! ```ignore
 //! use embedded_graphics::{pixelcolor::Rgb565, prelude::*};
-//! use mipidsi_async::ST7789;
+//! use mipidsi_async::{Rotation, ST7789};
 //!
 //! let mut display = ST7789::new(spi, dc, reset, 240, 240);
 //! // Set the panel's offset in the controller's 240 x 320 memory if needed.
 //! display.set_offset(0, 80);
 //! display.init(&mut delay).await?;
+//! // Rotate clockwise; drawing coordinates and dimensions follow the rotation.
+//! display.set_rotation(Rotation::Deg90).await?;
 //! // Some panels require inversion to show the expected colors.
 //! display.set_invert_colors(true).await?;
 //! display.clear(Rgb565::BLACK).await?;
@@ -42,6 +44,33 @@ const MEMORY_WIDTH: u16 = 240;
 const MEMORY_HEIGHT: u16 = 320;
 const BUFFER_BYTES: usize = 256;
 
+/// Display content rotation relative to the panel's portrait orientation.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Rotation {
+    /// No rotation.
+    #[default]
+    Deg0,
+    /// 90° clockwise rotation.
+    Deg90,
+    /// 180° clockwise rotation.
+    Deg180,
+    /// 270° clockwise rotation.
+    Deg270,
+}
+
+impl Rotation {
+    // MADCTL: MY (bit 7), MX (bit 6), MV (bit 5), RGB color order (bit 3 clear).
+    const fn madctl(self) -> u8 {
+        match self {
+            Self::Deg0 => 0x00,
+            Self::Deg90 => 0x60,
+            Self::Deg180 => 0xc0,
+            Self::Deg270 => 0xa0,
+        }
+    }
+}
+
 /// An error from the SPI device or a control pin.
 #[derive(Debug)]
 pub enum Error<SpiError, DcError, ResetError> {
@@ -65,6 +94,7 @@ pub struct ST7789<SPI, DC, RST> {
     height: u16,
     x_offset: u16,
     y_offset: u16,
+    rotation: Rotation,
 }
 
 impl<SPI, DC, RST> ST7789<SPI, DC, RST>
@@ -93,10 +123,14 @@ where
             height,
             x_offset: 0,
             y_offset: 0,
+            rotation: Rotation::Deg0,
         }
     }
 
     /// Sets the visible panel's offset in the controller's display RAM.
+    ///
+    /// Coordinates are relative to portrait orientation, regardless of the
+    /// current rotation. Drawing automatically transforms these offsets.
     ///
     /// This only changes the addresses used by subsequent drawing operations.
     ///
@@ -111,11 +145,11 @@ where
         self.y_offset = y;
     }
 
-    /// Resets the controller and turns on the display in portrait RGB565 mode.
+    /// Resets the controller and turns on the display in RGB565 mode.
     ///
     /// Uses the same command sequence and post-reset delays as the synchronous
     /// ST7789 model. Initialization disables color inversion and doesn't clear
-    /// display RAM.
+    /// display RAM. The current rotation is reapplied (portrait by default).
     pub async fn init(
         &mut self,
         delay: &mut impl DelayNs,
@@ -129,7 +163,7 @@ where
 
         self.command(0x11, &[]).await?; // SLPOUT
         delay.delay_ms(10).await;
-        self.command(0x36, &[0x00]).await?; // MADCTL: portrait, RGB order
+        self.set_rotation(self.rotation).await?;
         self.set_invert_colors(false).await?;
         self.command(0x3a, &[0x55]).await?; // COLMOD: 16-bit RGB565
         delay.delay_ms(10).await;
@@ -138,6 +172,28 @@ where
         self.command(0x29, &[]).await?; // DISPON
         delay.delay_ms(120).await;
 
+        Ok(())
+    }
+
+    /// Returns the current display rotation.
+    pub fn rotation(&self) -> Rotation {
+        self.rotation
+    }
+
+    /// Sets the clockwise rotation of subsequent drawing operations.
+    ///
+    /// Drawing coordinates start at the rotated panel's top left. At 90° and
+    /// 270°, the dimensions reported to embedded-graphics are swapped. Panel
+    /// dimensions and offsets remain defined in portrait orientation.
+    ///
+    /// This changes the controller's address mapping without clearing RAM or
+    /// rotating existing content; redraw the display after changing rotation.
+    pub async fn set_rotation(
+        &mut self,
+        rotation: Rotation,
+    ) -> Result<(), Error<SPI::Error, DC::Error, RST::Error>> {
+        self.command(0x36, &[rotation.madctl()]).await?; // MADCTL
+        self.rotation = rotation;
         Ok(())
     }
 
@@ -183,10 +239,20 @@ where
         x1: u16,
         y1: u16,
     ) -> Result<(), Error<SPI::Error, DC::Error, RST::Error>> {
-        let x0 = (x0 + self.x_offset).to_be_bytes();
-        let x1 = (x1 + self.x_offset).to_be_bytes();
-        let y0 = (y0 + self.y_offset).to_be_bytes();
-        let y1 = (y1 + self.y_offset).to_be_bytes();
+        // Reverse native offsets before swapping axes, just like MADCTL.
+        let (x_offset, y_offset) = match self.rotation {
+            Rotation::Deg0 => (self.x_offset, self.y_offset),
+            Rotation::Deg90 => (self.y_offset, MEMORY_WIDTH - self.width - self.x_offset),
+            Rotation::Deg180 => (
+                MEMORY_WIDTH - self.width - self.x_offset,
+                MEMORY_HEIGHT - self.height - self.y_offset,
+            ),
+            Rotation::Deg270 => (MEMORY_HEIGHT - self.height - self.y_offset, self.x_offset),
+        };
+        let x0 = (x0 + x_offset).to_be_bytes();
+        let x1 = (x1 + x_offset).to_be_bytes();
+        let y0 = (y0 + y_offset).to_be_bytes();
+        let y1 = (y1 + y_offset).to_be_bytes();
 
         self.command(0x2a, &[x0[0], x0[1], x1[0], x1[1]])
             .await?; // CASET
@@ -223,7 +289,11 @@ where
 
 impl<SPI, DC, RST> OriginDimensions for ST7789<SPI, DC, RST> {
     fn size(&self) -> Size {
-        Size::new(u32::from(self.width), u32::from(self.height))
+        let (width, height) = match self.rotation {
+            Rotation::Deg0 | Rotation::Deg180 => (self.width, self.height),
+            Rotation::Deg90 | Rotation::Deg270 => (self.height, self.width),
+        };
+        Size::new(u32::from(width), u32::from(height))
     }
 }
 
@@ -240,12 +310,9 @@ where
     where
         I: IntoIterator<Item = Pixel<Self::Color>>,
     {
+        let bounds = self.bounding_box();
         for Pixel(point, color) in pixels {
-            if point.x < 0
-                || point.y < 0
-                || point.x >= i32::from(self.width)
-                || point.y >= i32::from(self.height)
-            {
+            if !bounds.contains(point) {
                 continue;
             }
 
