@@ -13,39 +13,14 @@ use embedded_graphics_core::{
 use embedded_hal::digital::OutputPin;
 use embedded_hal_async::{delay::DelayNs, spi::SpiDevice};
 
+use crate::orientation::{MemoryMapping, Orientation, Rotation};
+
 const MEMORY_WIDTH: u16 = 240;
 const MEMORY_HEIGHT: u16 = 320;
 const BUFFER_BYTES: usize = 256;
 
 #[cfg(feature = "batch")]
 type PixelBatch = heapless::Vec<(usize, Pixel<Rgb565>), { BUFFER_BYTES / 2 }>;
-
-/// Display content rotation relative to the panel's portrait orientation.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum Rotation {
-    /// No rotation.
-    #[default]
-    Deg0,
-    /// 90° clockwise rotation.
-    Deg90,
-    /// 180° clockwise rotation.
-    Deg180,
-    /// 270° clockwise rotation.
-    Deg270,
-}
-
-impl Rotation {
-    // MADCTL: MY (bit 7), MX (bit 6), MV (bit 5), RGB color order (bit 3 clear).
-    const fn madctl(self) -> u8 {
-        match self {
-            Self::Deg0 => 0x00,
-            Self::Deg90 => 0x60,
-            Self::Deg180 => 0xc0,
-            Self::Deg270 => 0xa0,
-        }
-    }
-}
 
 /// An error from the SPI device or a control pin.
 #[derive(Debug)]
@@ -71,7 +46,7 @@ pub struct Display<SPI, DC, RST, const IS_ILI9341: bool> {
     height: u16,
     x_offset: u16,
     y_offset: u16,
-    rotation: Rotation,
+    orientation: Orientation,
 }
 
 impl<SPI, DC, RST, const IS_ILI9341: bool> Display<SPI, DC, RST, IS_ILI9341>
@@ -101,14 +76,14 @@ where
             height,
             x_offset: 0,
             y_offset: 0,
-            rotation: Rotation::Deg0,
+            orientation: Orientation::new(),
         }
     }
 
     /// Sets the visible panel's offset in the controller's display RAM.
     ///
     /// Coordinates are relative to portrait orientation, regardless of the
-    /// current rotation. Drawing automatically transforms these offsets.
+    /// current orientation. Drawing automatically transforms these offsets.
     ///
     /// This only changes the addresses used by subsequent drawing operations.
     ///
@@ -137,14 +112,36 @@ where
 
     /// Returns the current display rotation.
     pub fn rotation(&self) -> Rotation {
-        self.rotation
+        self.orientation.rotation
+    }
+
+    /// Returns the current display rotation and mirroring.
+    pub fn orientation(&self) -> Orientation {
+        self.orientation
+    }
+
+    /// Sets the rotation and mirroring of subsequent drawing operations.
+    ///
+    /// Uses the same [`Orientation`] transformations as the synchronous driver.
+    /// Dimensions follow the rotation, and panel offsets follow both rotation
+    /// and mirroring. Redraw the display after changing orientation: this changes
+    /// the controller's address mapping without transforming existing RAM.
+    pub async fn set_orientation(
+        &mut self,
+        orientation: Orientation,
+    ) -> Result<(), Error<SPI::Error, DC::Error, RST::Error>> {
+        let mapping = MemoryMapping::from_orientation(orientation);
+        self.command(0x36, &[mapping.madctl()]).await?; // MADCTL
+        self.orientation = orientation;
+        Ok(())
     }
 
     /// Sets the clockwise rotation of subsequent drawing operations.
     ///
     /// Drawing coordinates start at the rotated panel's top left. At 90° and
     /// 270°, the dimensions reported to embedded-graphics are swapped. Panel
-    /// dimensions and offsets remain defined in portrait orientation.
+    /// dimensions and offsets remain defined in portrait orientation. The
+    /// current mirroring setting is preserved.
     ///
     /// This changes the controller's address mapping without clearing RAM or
     /// rotating existing content; redraw the display after changing rotation.
@@ -152,9 +149,11 @@ where
         &mut self,
         rotation: Rotation,
     ) -> Result<(), Error<SPI::Error, DC::Error, RST::Error>> {
-        self.command(0x36, &[rotation.madctl()]).await?; // MADCTL
-        self.rotation = rotation;
-        Ok(())
+        self.set_orientation(Orientation {
+            rotation,
+            ..self.orientation
+        })
+        .await
     }
 
     /// Enables or disables the panel's color inversion mode.
@@ -200,14 +199,21 @@ where
         y1: u16,
     ) -> Result<(), Error<SPI::Error, DC::Error, RST::Error>> {
         // Reverse native offsets before swapping axes, just like MADCTL.
-        let (x_offset, y_offset) = match self.rotation {
-            Rotation::Deg0 => (self.x_offset, self.y_offset),
-            Rotation::Deg90 => (self.y_offset, MEMORY_WIDTH - self.width - self.x_offset),
-            Rotation::Deg180 => (
-                MEMORY_WIDTH - self.width - self.x_offset,
-                MEMORY_HEIGHT - self.height - self.y_offset,
-            ),
-            Rotation::Deg270 => (MEMORY_HEIGHT - self.height - self.y_offset, self.x_offset),
+        let mapping = MemoryMapping::from_orientation(self.orientation);
+        let x_offset = if mapping.reverse_columns {
+            MEMORY_WIDTH - self.width - self.x_offset
+        } else {
+            self.x_offset
+        };
+        let y_offset = if mapping.reverse_rows {
+            MEMORY_HEIGHT - self.height - self.y_offset
+        } else {
+            self.y_offset
+        };
+        let (x_offset, y_offset) = if mapping.swap_rows_and_columns {
+            (y_offset, x_offset)
+        } else {
+            (x_offset, y_offset)
         };
         let x0 = (x0 + x_offset).to_be_bytes();
         let x1 = (x1 + x_offset).to_be_bytes();
@@ -308,7 +314,7 @@ where
 
 impl<SPI, DC, RST, const IS_ILI9341: bool> OriginDimensions for Display<SPI, DC, RST, IS_ILI9341> {
     fn size(&self) -> Size {
-        let (width, height) = match self.rotation {
+        let (width, height) = match self.orientation.rotation {
             Rotation::Deg0 | Rotation::Deg180 => (self.width, self.height),
             Rotation::Deg90 | Rotation::Deg270 => (self.height, self.width),
         };

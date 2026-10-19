@@ -17,15 +17,15 @@ where
     /// Resets the ILI9341 and turns on the display in RGB565 mode.
     ///
     /// Uses the synchronous ILI9341 model's command sequence and post-reset
-    /// delays. Disables color inversion and reapplies the current rotation
-    /// (portrait by default), without clearing display RAM.
+    /// delays. Disables color inversion and reapplies the current orientation
+    /// (unmirrored portrait by default), without clearing display RAM.
     pub async fn init(
         &mut self,
         delay: &mut impl DelayNs,
     ) -> Result<(), Error<SPI::Error, DC::Error, RST::Error>> {
         self.hardware_reset(delay).await?;
         delay.delay_ms(5).await;
-        self.set_rotation(self.rotation()).await?;
+        self.set_orientation(self.orientation()).await?;
         self.command(0xb4, &[0x00]).await?; // Display inversion control
         self.set_invert_colors(false).await?;
         self.command(0x3a, &[0x55]).await?; // COLMOD: 16-bit RGB565

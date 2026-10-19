@@ -16,7 +16,7 @@
 //!
 //! ```ignore
 //! use embedded_graphics::{pixelcolor::Rgb565, prelude::*};
-//! use mipidsi_async::{Rotation, ST7789};
+//! use mipidsi_async::{Orientation, Rotation, ST7789};
 //!
 //! let mut display = ST7789::new(spi, dc, reset, 240, 240);
 //! // Set the panel's offset in the controller's 240 x 320 memory if needed.
@@ -24,6 +24,10 @@
 //! display.init(&mut delay).await?;
 //! // Rotate clockwise; drawing coordinates and dimensions follow the rotation.
 //! display.set_rotation(Rotation::Deg90).await?;
+//! // Rotation and mirroring use the same orientation API as the sync driver.
+//! display
+//!     .set_orientation(Orientation::new().rotate(Rotation::Deg90).flip_horizontal())
+//!     .await?;
 //! // Some panels require inversion to show the expected colors.
 //! display.set_invert_colors(true).await?;
 //! display.clear(Rgb565::BLACK).await?;
@@ -36,8 +40,10 @@
 
 mod display;
 pub mod ili9341;
+pub mod orientation;
 pub mod st7789;
 
-pub use display::{Display, Error, Rotation};
+pub use display::{Display, Error};
 pub use ili9341::ILI9341;
+pub use orientation::{InvalidAngleError, MemoryMapping, Orientation, Rotation};
 pub use st7789::ST7789;

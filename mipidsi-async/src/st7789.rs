@@ -17,8 +17,8 @@ where
     /// Resets the ST7789 and turns on the display in RGB565 mode.
     ///
     /// Uses the synchronous ST7789 model's command sequence and post-reset
-    /// delays. Disables color inversion and reapplies the current rotation
-    /// (portrait by default), without clearing display RAM.
+    /// delays. Disables color inversion and reapplies the current orientation
+    /// (unmirrored portrait by default), without clearing display RAM.
     pub async fn init(
         &mut self,
         delay: &mut impl DelayNs,
@@ -27,7 +27,7 @@ where
         delay.delay_ms(150).await;
         self.command(0x11, &[]).await?; // SLPOUT
         delay.delay_ms(10).await;
-        self.set_rotation(self.rotation()).await?;
+        self.set_orientation(self.orientation()).await?;
         self.set_invert_colors(false).await?;
         self.command(0x3a, &[0x55]).await?; // COLMOD: 16-bit RGB565
         delay.delay_ms(10).await;
